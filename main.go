@@ -630,7 +630,7 @@ func main() {
 	flag.BoolVar(&cfg.retry, "retry", true, "when TCP connects but TLS/HTTP stall, retry with smaller packets to diagnose MTU problems")
 	flag.StringVar(&cfg.forceIP, "ip", "", "connect to this IP instead of the DNS answer; Host header and SNI keep the hostname (like curl --resolve)")
 	flag.BoolVar(&cfg.prefer6, "6", false, "prefer an IPv6 address when DNS returns both")
-	flag.StringVar(&cfg.pcap, "pcap", "", "write a packet capture (tcpdump) of traffic to/from the target IP to this file")
+	flag.StringVar(&cfg.pcap, "pcap", "", "write a packet capture (tcpdump, or dumpcap as fallback) of traffic to/from the target IP to this file")
 	flag.StringVar(&cfg.pcapIface, "pcap-iface", "any", "interface for -pcap")
 	var tuiMode, copyFlag bool
 	flag.BoolVar(&copyFlag, "copy", false, "copy the report to the clipboard when done (TUI: press y)")

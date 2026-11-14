@@ -240,7 +240,7 @@ func (m *model) runOne(i int) {
 	path := ""
 	if needCap {
 		path = timestampedPath(cfg.pcap)
-		m.pcapState = "starting tcpdump…"
+		m.pcapState = "starting capture…"
 	}
 	go func() {
 		msg := preparedMsg{target: t, ip: t.ip, how: t.pinHow}

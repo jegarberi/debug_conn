@@ -68,7 +68,7 @@ func (t *target) pinNote() string {
 
 // ---------- packet capture ----------
 
-// capture runs tcpdump in the background, writing a pcap of all traffic to
+// capture runs tcpdump (or dumpcap) in the background, writing a pcap of all traffic to
 // and from the pinned IP, plus ICMP (traceroute replies and "fragmentation
 // needed" messages come from intermediate routers, not from the target).
 type capture struct {
@@ -89,22 +89,47 @@ func pcapFilter(ip string) string {
 	return fmt.Sprintf("host %s or icmp", ip)
 }
 
-// startCapture launches tcpdump and waits until it is listening, so the
-// first packets of the tests are not missed.
+// startCapture launches tcpdump (or, if that fails, Wireshark's dumpcap,
+// which distros often install with capture capabilities for the "pcap" or
+// "wireshark" group) and waits until it is listening, so the first packets
+// of the tests are not missed.
 func startCapture(path, iface, ip string) (*capture, error) {
-	bin, err := exec.LookPath("tcpdump")
-	if err != nil {
-		return nil, fmt.Errorf("tcpdump not found (install the tcpdump package)")
-	}
-	c := &capture{path: path, filter: pcapFilter(ip), done: make(chan struct{})}
-	// --immediate-mode + -U: hand over and write each packet at once, so
-	// nothing is lost in kernel buffers when we stop it (or get killed)
+	filter := pcapFilter(ip)
+	// tcpdump: --immediate-mode + -U write each packet at once, so nothing
+	// is lost in kernel buffers when we stop it (or get killed);
 	// -s 0: full packets; -n: no DNS lookups for the capture itself
-	args := []string{"-i", iface, "--immediate-mode", "-U", "-n", "-s", "0", "-w", path}
+	tcpdumpArgs := []string{"-i", iface, "--immediate-mode", "-U", "-n", "-s", "0", "-w", path}
 	if os.Geteuid() == 0 {
-		args = append(args, "-Z", "root") // keep write access to path
+		tcpdumpArgs = append(tcpdumpArgs, "-Z", "root") // keep write access to path
 	}
-	args = append(args, c.filter)
+	tools := []struct {
+		name, ready string
+		args        []string
+	}{
+		{"tcpdump", "listening on", append(tcpdumpArgs, filter)},
+		{"dumpcap", "Capturing on", []string{"-i", iface, "-P", "-f", filter, "-w", path}}, // -P: pcap, not pcapng
+	}
+	var errs []string
+	for _, t := range tools {
+		bin, err := exec.LookPath(t.name)
+		if err != nil {
+			continue
+		}
+		c, err := launchCapture(bin, t.args, t.ready, path, filter)
+		if err == nil {
+			return c, nil
+		}
+		errs = append(errs, t.name+" failed: "+err.Error())
+	}
+	if len(errs) == 0 {
+		return nil, fmt.Errorf("neither tcpdump nor dumpcap found (install the tcpdump package)")
+	}
+	msg := strings.Join(errs, "; ")
+	return nil, fmt.Errorf("%s%s", msg, privilegeHint(msg))
+}
+
+func launchCapture(bin string, args []string, readyMarker, path, filter string) (*capture, error) {
+	c := &capture{path: path, filter: filter, done: make(chan struct{})}
 	c.cmd = exec.Command(bin, args...)
 	c.cmd.SysProcAttr = sysProcAttrNewGroup()
 	stderr, err := c.cmd.StderrPipe()
@@ -122,7 +147,7 @@ func startCapture(path, iface, ip string) (*capture, error) {
 			c.mu.Lock()
 			c.stderr = append(c.stderr, l)
 			c.mu.Unlock()
-			if strings.Contains(l, "listening on") {
+			if strings.Contains(l, readyMarker) {
 				select {
 				case ready <- true:
 				default:
@@ -140,10 +165,10 @@ func startCapture(path, iface, ip string) (*capture, error) {
 		}
 	case <-time.After(5 * time.Second):
 		c.kill()
-		return nil, fmt.Errorf("tcpdump did not start listening within 5s")
+		return nil, fmt.Errorf("did not start listening within 5s")
 	}
 	<-c.done
-	return nil, fmt.Errorf("tcpdump failed: %s%s", c.lastErr(), privilegeHint(c.lastErr()))
+	return nil, fmt.Errorf("%s", c.lastErr())
 }
 
 func (c *capture) lastErr() string {
@@ -157,7 +182,7 @@ func (c *capture) lastErr() string {
 
 func privilegeHint(msg string) string {
 	m := strings.ToLower(msg)
-	if strings.Contains(m, "permission") || strings.Contains(m, "operation not permitted") {
+	if strings.Contains(m, "permission") || strings.Contains(m, "not permitted") || strings.Contains(m, "cap_net_raw") {
 		return "\n  capturing needs root or capabilities, e.g.:\n" +
 			"    sudo setcap cap_net_raw,cap_net_admin=eip $(command -v tcpdump)\n" +
 			"  or run debug_conn with sudo"
@@ -171,7 +196,8 @@ func (c *capture) kill() {
 	}
 }
 
-var reCaptured = regexp.MustCompile(`(\d+) packets? captured`)
+// tcpdump: "12 packets captured"; dumpcap: "Packets captured: 12"
+var reCaptured = regexp.MustCompile(`(?i)(\d+) packets? captured|packets captured: (\d+)`)
 
 // stop ends the capture (SIGINT lets tcpdump flush and print its counters)
 // and returns a one-line summary.
@@ -192,7 +218,7 @@ func (c *capture) stop() string {
 	n := "?"
 	for _, l := range c.stderr {
 		if m := reCaptured.FindStringSubmatch(l); m != nil {
-			n = m[1]
+			n = m[1] + m[2]
 		}
 	}
 	c.packets = n
