@@ -1,3 +1,7 @@
 # build output
 /debug_conn
 /debug_conn.exe
+
+# packet captures (may contain private network data)
+*.pcap
+*.pcapng

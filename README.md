@@ -22,7 +22,16 @@ Requires Go 1.23+. Traceroute uses the system `traceroute`, `tracepath` or `mtr`
 ./debug_conn -tests tcp,tls example.com:8443  # only some tests
 ./debug_conn -copy https://example.com        # also copy the report to the clipboard
 ./debug_conn -mss 1200 https://example.com    # force a smaller TCP MSS
+./debug_conn -ip 203.0.113.10 https://example.com   # test one backend, keep Host/SNI
+sudo ./debug_conn -pcap run.pcap https://example.com # record a packet capture
 ```
+
+The target is resolved **once**; TCP, TLS, HTTP, traceroute and the packet
+capture all go to that IP, while TLS sends the hostname as SNI and HTTP sends
+it as the `Host` header (like `curl --resolve`). With round-robin DNS every
+test therefore looks at the same server. `-ip` replaces the DNS answer, so you
+can test a specific backend, a CDN edge, or a server before a DNS cutover.
+IPv4 is preferred when DNS returns both (`-6` to prefer IPv6).
 
 | Flag | Default | Description |
 |---|---|---|
@@ -36,6 +45,10 @@ Requires Go 1.23+. Traceroute uses the system `traceroute`, `tracepath` or `mtr`
 | `-body N` | `0` | print the first N bytes of the response body |
 | `-mss N` | kernel | TCP MSS to advertise and use (Linux/macOS/BSD) |
 | `-retry` | `true` | when TCP connects but TLS/HTTP stall, probe for MTU problems |
+| `-ip` | DNS | connect to this IP; Host header and SNI keep the hostname |
+| `-6` | off | prefer an IPv6 address when DNS returns both |
+| `-pcap FILE` | off | record traffic to/from the target IP, plus ICMP, with tcpdump |
+| `-pcap-iface` | `any` | interface for `-pcap` |
 | `-copy` | off | copy the plain-text report to the clipboard |
 | `-tui` | off | interactive UI (default when no target is given) |
 
@@ -55,6 +68,20 @@ Exit code is `1` if any test fails.
 | `y` / `Y` | copy full report / selected test to clipboard |
 | `PgUp`/`PgDn`, mouse wheel | scroll |
 | `q` | quit |
+
+## Packet capture
+
+`-pcap` runs `tcpdump` in the background with the filter `host <ip> or icmp`.
+ICMP is included because traceroute replies and "fragmentation needed"
+messages come from routers on the path, not from the target. Open the file in
+Wireshark or with `tcpdump -nn -r FILE`. In the TUI each run writes its own
+file (`FILE-YYYYMMDD-HHMMSS.pcap`).
+
+Capturing needs root, or capabilities on tcpdump:
+
+```bash
+sudo setcap cap_net_raw,cap_net_admin=eip "$(command -v tcpdump)"
+```
 
 ## MTU black-hole diagnosis
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -76,6 +77,22 @@ type copiedMsg struct {
 	err       error
 }
 
+// preparedMsg arrives once the target IP is pinned (and a capture started,
+// if -pcap is set); the queued tests then start.
+type preparedMsg struct {
+	target *target
+	ip     string
+	how    string
+	err    error
+	capt   *capture
+	capErr error
+}
+
+type captureDoneMsg struct {
+	summary string
+	c       *capture
+}
+
 type doneMsg struct {
 	idx, run int
 	ok       bool
@@ -102,6 +119,11 @@ type model struct {
 
 	width, height int
 	ready         bool
+
+	pending   map[int]bool // tests waiting for preparation
+	preparing bool
+	capt      *capture // running capture, nil if none
+	pcapState string   // shown in the sidebar
 }
 
 func runTUI(t *target, cfg *config, testsSet bool) error {
@@ -110,6 +132,9 @@ func runTUI(t *target, cfg *config, testsSet bool) error {
 	final, err := p.Run()
 	if fm, ok := final.(*model); ok {
 		fm.cancelAll()
+		if fm.capt != nil {
+			fmt.Println("pcap:", fm.capt.stop())
+		}
 	}
 	return err
 }
@@ -120,6 +145,7 @@ func newModel(t *target, cfg *config, testsSet bool) *model {
 		testsSet: testsSet,
 		target:   t,
 		events:   make(chan tea.Msg, 1024),
+		pending:  map[int]bool{},
 	}
 	for _, name := range allTests {
 		m.tests = append(m.tests, &testState{name: name, title: name, enabled: cfg.tests[name]})
@@ -184,6 +210,8 @@ func (m *model) runAll() {
 	}
 }
 
+// runOne queues a test. Tests start once the target IP is pinned and, with
+// -pcap, a capture is running; both happen off the UI goroutine.
 func (m *model) runOne(i int) {
 	if m.target == nil {
 		return
@@ -191,16 +219,75 @@ func (m *model) runOne(i int) {
 	ts := m.tests[i]
 	if ts.cancel != nil {
 		ts.cancel()
+		ts.cancel = nil
 	}
+	ts.run++ // drop output from a previous run of this test
+	ts.status, ts.lines, ts.warned, ts.title, ts.dur = stRunning, nil, false, ts.name, 0
+	ts.start = time.Now()
+
+	needPin := m.target.ip == "" && m.target.pinHow == ""
+	needCap := m.cfg.pcap != "" && m.capt == nil
+	if !needPin && !needCap && !m.preparing {
+		m.launch(i)
+		return
+	}
+	m.pending[i] = true
+	if m.preparing {
+		return
+	}
+	m.preparing = true
+	t, cfg, ch := m.target, *m.cfg, m.events
+	path := ""
+	if needCap {
+		path = timestampedPath(cfg.pcap)
+		m.pcapState = "starting tcpdump…"
+	}
+	go func() {
+		msg := preparedMsg{target: t, ip: t.ip, how: t.pinHow}
+		if needPin {
+			msg.ip, msg.how, msg.err = resolvePin(context.Background(), t, &cfg)
+			if msg.err != nil {
+				msg.how = "unresolved"
+			}
+		}
+		if path != "" && msg.ip != "" {
+			msg.capt, msg.capErr = startCapture(path, cfg.pcapIface, msg.ip)
+		}
+		ch <- msg
+	}()
+}
+
+// timestampedPath turns "x.pcap" into "x-20261114-051833.pcap", so each run
+// in the TUI gets its own capture file.
+func timestampedPath(p string) string {
+	ext := filepath.Ext(p)
+	return strings.TrimSuffix(p, ext) + time.Now().Format("-20060102-150405") + ext
+}
+
+func (m *model) anyRunning() bool {
+	for _, ts := range m.tests {
+		if ts.status == stRunning {
+			return true
+		}
+	}
+	return false
+}
+
+// maybeStopCapture ends the capture once no test is running anymore.
+func (m *model) maybeStopCapture() tea.Cmd {
+	if m.capt == nil || m.anyRunning() || m.preparing {
+		return nil
+	}
+	c := m.capt
+	m.capt = nil
+	m.pcapState = "stopping…"
+	return func() tea.Msg { return captureDoneMsg{c.stop(), c} }
+}
+
+func (m *model) launch(i int) {
+	ts := m.tests[i]
 	ctx, cancel := context.WithCancel(context.Background())
 	ts.cancel = cancel
-	ts.run++
-	ts.status = stRunning
-	ts.lines = nil
-	ts.warned = false
-	ts.title = ts.name
-	ts.start = time.Now()
-	ts.dur = 0
 
 	run, t, ch := ts.run, *m.target, m.events
 	cfg := *m.cfg
@@ -227,9 +314,14 @@ func (m *model) runOne(i int) {
 }
 
 func (m *model) cancelAll() {
-	for _, ts := range m.tests {
+	for i, ts := range m.tests {
 		if ts.cancel != nil {
 			ts.cancel()
+		}
+		if m.pending[i] {
+			delete(m.pending, i)
+			ts.run++
+			ts.status = stIdle
 		}
 	}
 }
@@ -269,7 +361,54 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			ts.cancel = nil
 		}
+		cmds = append(cmds, m.waitEvent(), m.maybeStopCapture())
+
+	case preparedMsg:
 		cmds = append(cmds, m.waitEvent())
+		m.preparing = false
+		if msg.target != m.target { // target changed meanwhile
+			if msg.capt != nil {
+				go msg.capt.stop()
+			}
+			if len(m.pending) > 0 {
+				for i := range m.pending {
+					delete(m.pending, i)
+					m.runOne(i)
+				}
+			}
+			break
+		}
+		m.target.ip, m.target.pinHow = msg.ip, msg.how
+		if msg.err != nil {
+			m.errMsg = "resolve: " + msg.err.Error()
+		}
+		switch {
+		case msg.capt != nil:
+			m.capt = msg.capt
+			m.pcapState = sOK.Render("● ") + "recording " + filepath.Base(msg.capt.path)
+		case msg.capErr != nil:
+			m.pcapState = sFail.Render("✗ ") + firstLine(msg.capErr.Error())
+			m.notice = sErr.Render("✗ pcap: " + strings.Join(strings.Fields(msg.capErr.Error()), " "))
+			m.noticeN++
+			n := m.noticeN
+			cmds = append(cmds, tea.Tick(8*time.Second, func(time.Time) tea.Msg { return clearNoticeMsg{n} }))
+		}
+		for i := range m.pending {
+			delete(m.pending, i)
+			m.launch(i)
+		}
+		if m.cfg.pcap != "" && msg.capErr != nil {
+			m.cfg.pcap = "" // don't retry a failing capture on every run
+		}
+
+	case captureDoneMsg:
+		m.pcapState = sOK.Render("✓ ") + msg.c.packets + " pkts " + sDim.Render(filepath.Base(msg.c.path))
+		if m.capt == nil && !m.anyRunning() {
+			m.notice = sOK.Render("✓ pcap: ") + msg.summary
+			m.noticeN++
+			n := m.noticeN
+			cmds = append(cmds, tea.Tick(6*time.Second, func(time.Time) tea.Msg { return clearNoticeMsg{n} }))
+		}
 
 	case copiedMsg:
 		if msg.err != nil {
@@ -332,6 +471,7 @@ func (m *model) updateEditing(msg tea.KeyMsg) tea.Cmd {
 		m.errMsg = ""
 		m.target = t
 		m.cancelAll()
+		m.errMsg = ""
 		for _, ts := range m.tests { // forget results from the previous target
 			ts.run++
 			ts.status, ts.lines, ts.warned, ts.dur, ts.cancel, ts.title = stIdle, nil, false, 0, nil, ts.name
@@ -598,6 +738,16 @@ func (m *model) renderList(height int) string {
 		ins = sWarn.Render("ON")
 	}
 	opts = append(opts, sDim.Render(" insecure ")+ins+sDim.Render("  (i)"))
+	if m.cfg.forceIP != "" {
+		opts = append(opts, sDim.Render(" ip       ")+sWarn.Render(m.cfg.forceIP))
+	}
+	if m.pcapState != "" || m.cfg.pcap != "" {
+		st := m.pcapState
+		if st == "" {
+			st = sDim.Render("on next run")
+		}
+		opts = append(opts, sDim.Render(" pcap")+" "+lipgloss.NewStyle().MaxWidth(inner-6).Render(st))
+	}
 	rows = append(rows, opts...)
 
 	return sBox.Width(inner).Height(height - 2).Render(clipLines(strings.Join(rows, "\n"), height-2))
@@ -630,7 +780,11 @@ func (m *model) View() string {
 	if m.editing {
 		tgt = sAccent.Render("› ") + m.input.View()
 	} else if m.target != nil {
-		tgt = sBold.Render(m.target.url()) + sDim.Render(fmt.Sprintf("  (%s:%s)", m.target.host, m.target.port))
+		tgt = sBold.Render(m.target.url()) + sDim.Render(fmt.Sprintf("  (%s:%s", m.target.host, m.target.port))
+		if m.target.ip != "" && m.target.ip != m.target.host {
+			tgt += sDim.Render(" → ") + sAccent.Render(m.target.ip)
+		}
+		tgt += sDim.Render(")")
 	}
 	header := sBadge.Render("debug_conn") + " " + sDim.Render("target") + " " + tgt
 	if m.errMsg != "" {
@@ -670,4 +824,11 @@ func clipLines(s string, n int) string {
 		lines = lines[:max(0, n)]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

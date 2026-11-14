@@ -42,6 +42,8 @@ type target struct {
 	host   string
 	port   string
 	path   string
+	ip     string // pinned IP all connections go to ("" = not resolved)
+	pinHow string // how ip was chosen, for the report
 }
 
 type config struct {
@@ -51,8 +53,12 @@ type config struct {
 	maxHops      int
 	method       string
 	showBody     int
-	mss          int  // TCP MSS to advertise (0 = kernel default)
-	retry        bool // on a stalled handshake, probe for MTU problems
+	mss          int    // TCP MSS to advertise (0 = kernel default)
+	retry        bool   // on a stalled handshake, probe for MTU problems
+	forceIP      string // -ip: connect here instead of the DNS answer
+	prefer6      bool   // pin an IPv6 address when DNS returns both
+	pcap         string // -pcap: write a packet capture here
+	pcapIface    string
 	tests        map[string]bool
 	portOverride string
 	context      context.Context // cancelled when the TUI quits or re-runs
@@ -229,7 +235,14 @@ func testDNS(t *target, cfg *config, r *reporter) bool {
 		if names, err := res.LookupAddr(ctx, a.IP.String()); err == nil && len(names) > 0 {
 			ptr = "  (PTR " + names[0] + ")"
 		}
-		r.info("%s %s%s", kind, a.IP, ptr)
+		pin := ""
+		if t.ip == a.IP.String() {
+			pin = "  ← used for the tests"
+		}
+		r.info("%s %s%s%s", kind, a.IP, ptr, pin)
+	}
+	if cfg.forceIP != "" {
+		r.warn("-ip %s given: tests connect there, ignoring these answers", cfg.forceIP)
 	}
 	return true
 }
@@ -244,10 +257,10 @@ func testTraceroute(t *target, cfg *config, r *reporter) bool {
 		args []string
 	}
 	cands := []cand{
-		{"traceroute", []string{"-n", "-w", "2", "-q", "1", "-m", hops, t.host}},
-		{"tracepath", []string{"-n", "-m", hops, t.host}},
-		{"mtr", []string{"-n", "-r", "-c", "1", "-m", hops, t.host}},
-		{"tracert", []string{"-d", "-h", hops, t.host}}, // Windows
+		{"traceroute", []string{"-n", "-w", "2", "-q", "1", "-m", hops, t.dialHost()}},
+		{"tracepath", []string{"-n", "-m", hops, t.dialHost()}},
+		{"mtr", []string{"-n", "-r", "-c", "1", "-m", hops, t.dialHost()}},
+		{"tracert", []string{"-d", "-h", hops, t.dialHost()}}, // Windows
 	}
 	for _, c := range cands {
 		path, err := exec.LookPath(c.bin)
@@ -294,10 +307,16 @@ func testTCP(t *target, cfg *config, r *reporter) bool {
 	r.title("tcp (telnet " + t.host + " " + t.port + ")")
 	ctx, cancel := context.WithTimeout(cfg.ctx(), cfg.timeout)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, t.host)
-	if err != nil {
-		r.fail("resolve: %v", err)
-		return false
+	var ips []net.IPAddr
+	if cfg.forceIP != "" || net.ParseIP(t.host) != nil {
+		ips = []net.IPAddr{{IP: net.ParseIP(t.dialHost())}}
+	} else {
+		var err error
+		ips, err = net.DefaultResolver.LookupIPAddr(ctx, t.host)
+		if err != nil {
+			r.fail("resolve: %v", err)
+			return false
+		}
 	}
 	allOK := true
 	anyOK := false
@@ -315,6 +334,9 @@ func testTCP(t *target, cfg *config, r *reporter) bool {
 		mssInfo := ""
 		if m, ok := effectiveMSS(conn); ok {
 			mssInfo = fmt.Sprintf(", mss %d", m)
+		}
+		if len(ips) > 1 && ip.IP.String() == t.ip {
+			mssInfo += "; used by tls/http"
 		}
 		r.ok("connected to %s in %s (local %s%s)", addr, dur.Round(time.Microsecond), conn.LocalAddr(), mssInfo)
 		// Some services (SMTP, SSH, FTP) send a banner; HTTP/TLS do not.
@@ -342,25 +364,26 @@ var tlsVersions = map[uint16]string{
 }
 
 func testTLS(t *target, cfg *config, r *reporter) bool {
-	r.title("tls (openssl s_client -connect " + t.addr() + ")")
+	title := "tls (openssl s_client -connect " + t.dialAddr()
+	if sn := tlsSNI(t, cfg); sn != "" {
+		title += " -servername " + sn
+	}
+	r.title(title + ")")
 	if t.scheme == "http" {
 		r.warn("target scheme is http; attempting TLS on port %s anyway", t.port)
 	}
-	sni := cfg.serverName
-	if sni == "" && net.ParseIP(t.host) == nil {
-		sni = t.host
-	}
+	sni := tlsSNI(t, cfg)
 	if cfg.mss > 0 {
 		r.info("using MSS %d", cfg.mss)
 	}
-	res := tlsHandshake(cfg.ctx(), t.addr(), sni, cfg.timeout, cfg.mss, false)
+	res := tlsHandshake(cfg.ctx(), t.dialAddr(), sni, cfg.timeout, cfg.mss, false)
 	dur := res.dur
 	if res.err != nil {
 		if !res.connected {
-			r.fail("connect to %s: %v", t.addr(), res.err)
+			r.fail("connect to %s: %v", t.dialAddr(), res.err)
 			return false
 		}
-		r.fail("TCP connected, but the TLS handshake with %s failed: %v", t.addr(), res.err)
+		r.fail("TCP connected, but the TLS handshake with %s failed: %v", t.dialAddr(), res.err)
 		if cfg.retry && isTimeout(res.err) && cfg.ctx().Err() == nil {
 			probeStall(t, cfg, sni, r)
 		}
@@ -426,6 +449,18 @@ func testTLS(t *target, cfg *config, r *reporter) bool {
 	return true
 }
 
+// tlsSNI is the server name sent in the ClientHello: -servername, else the
+// hostname (none for an IP literal, like openssl/curl).
+func tlsSNI(t *target, cfg *config) string {
+	if cfg.serverName != "" {
+		return cfg.serverName
+	}
+	if net.ParseIP(t.host) == nil {
+		return t.host
+	}
+	return ""
+}
+
 func orNone(s string) string {
 	if s == "" {
 		return "(none)"
@@ -458,7 +493,7 @@ func testHTTP(t *target, cfg *config, r *reporter) bool {
 	}
 	tr := &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
-		DialContext:       dialer(cfg.timeout, cfg.mss).DialContext,
+		DialContext:       pinnedDial(t, dialer(cfg.timeout, cfg.mss)),
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: cfg.insecure, ServerName: cfg.serverName},
 		ForceAttemptHTTP2: true,
 		DisableKeepAlives: true,
@@ -480,6 +515,9 @@ func testHTTP(t *target, cfg *config, r *reporter) bool {
 
 	if p, _ := http.ProxyFromEnvironment(req); p != nil {
 		r.info("using proxy %s", p)
+	}
+	if p, _ := http.ProxyFromEnvironment(req); p == nil && t.ip != "" && t.ip != t.host {
+		r.info("* connecting to %s (Host header and SNI: %s)", t.dialAddr(), t.host)
 	}
 	r.info("> %s %s", req.Method, req.URL.RequestURI())
 	r.info("> Host: %s", req.URL.Host)
@@ -563,6 +601,18 @@ func testHTTP(t *target, cfg *config, r *reporter) bool {
 	return true
 }
 
+// pinnedDial sends connections for the target's host:port to the pinned IP,
+// leaving the URL (and so the Host header and SNI) untouched. Connections to
+// anything else, e.g. an HTTP proxy, are dialed normally.
+func pinnedDial(t *target, d *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if t.ip != "" && addr == t.addr() {
+			addr = t.dialAddr()
+		}
+		return d.DialContext(ctx, network, addr)
+	}
+}
+
 // ---------- main ----------
 
 func main() {
@@ -578,6 +628,10 @@ func main() {
 	flag.StringVar(&portFlag, "port", "", "override port")
 	flag.IntVar(&cfg.mss, "mss", 0, "TCP MSS to advertise/use, e.g. 1200 (tests MTU problems; 0 = kernel default)")
 	flag.BoolVar(&cfg.retry, "retry", true, "when TCP connects but TLS/HTTP stall, retry with smaller packets to diagnose MTU problems")
+	flag.StringVar(&cfg.forceIP, "ip", "", "connect to this IP instead of the DNS answer; Host header and SNI keep the hostname (like curl --resolve)")
+	flag.BoolVar(&cfg.prefer6, "6", false, "prefer an IPv6 address when DNS returns both")
+	flag.StringVar(&cfg.pcap, "pcap", "", "write a packet capture (tcpdump) of traffic to/from the target IP to this file")
+	flag.StringVar(&cfg.pcapIface, "pcap-iface", "any", "interface for -pcap")
 	var tuiMode, copyFlag bool
 	flag.BoolVar(&copyFlag, "copy", false, "copy the report to the clipboard when done (TUI: press y)")
 	flag.BoolVar(&tuiMode, "tui", false, "interactive terminal UI (default when no target is given)")
@@ -606,6 +660,14 @@ func main() {
 	if cfg.mss != 0 && (cfg.mss < 88 || cfg.mss > 65495) {
 		fmt.Fprintln(os.Stderr, "error: -mss must be between 88 and 65495")
 		os.Exit(2)
+	}
+	if cfg.forceIP != "" {
+		ip := net.ParseIP(strings.Trim(cfg.forceIP, "[]"))
+		if ip == nil {
+			fmt.Fprintln(os.Stderr, "error: -ip must be an IP address")
+			os.Exit(2)
+		}
+		cfg.forceIP = ip.String()
 	}
 	if cfg.mss != 0 && !mssSupported {
 		fmt.Fprintln(os.Stderr, "warning: -mss is not supported on this platform and will be ignored")
@@ -639,14 +701,35 @@ func main() {
 		return
 	}
 
+	var pinErr error
+	t.ip, t.pinHow, pinErr = resolvePin(cfg.ctx(), t, cfg)
 	fmt.Print(reportHeader(t))
 	cliReport.WriteString(reportHeader(t))
+	if pinErr != nil {
+		cliReporter.warn("could not resolve %s: %v", t.host, pinErr)
+	}
+
+	var capt *capture
+	if cfg.pcap != "" {
+		if t.ip == "" {
+			cliReporter.fail("pcap: no IP to capture (resolution failed)")
+		} else if c, err := startCapture(cfg.pcap, cfg.pcapIface, t.ip); err != nil {
+			cliReporter.fail("pcap: %v", err)
+		} else {
+			capt = c
+			cliReporter.ok("pcap: capturing %s on %s -> %s", c.filter, cfg.pcapIface, cfg.pcap)
+		}
+	}
 
 	results := map[string]bool{}
 	var ran []string
 	for _, name := range selectedTests(t, cfg, testsSet) {
 		ran = append(ran, name)
 		results[name] = runners[name](t, cfg, cliReporter)
+	}
+	capSummary := ""
+	if capt != nil {
+		capSummary = capt.stop()
 	}
 
 	cliReporter.title("summary")
@@ -658,6 +741,9 @@ func main() {
 			cliReporter.fail("%s", name)
 			failed++
 		}
+	}
+	if capSummary != "" {
+		cliReporter.info("pcap: %s", capSummary)
 	}
 	if copyFlag {
 		if how, err := copyToClipboard(cliReport.String()); err != nil {

@@ -35,8 +35,11 @@ func formatLine(l line, colored bool) string {
 }
 
 func reportHeader(t *target) string {
-	return fmt.Sprintf("Target: %s  (host=%s port=%s scheme=%s)\nTime  : %s\n",
-		t.raw, t.host, t.port, t.scheme, time.Now().Format(time.RFC3339))
+	h := fmt.Sprintf("Target: %s  (host=%s port=%s scheme=%s)\n", t.raw, t.host, t.port, t.scheme)
+	if t.ip != "" {
+		h += fmt.Sprintf("IP    : %s  (%s; Host header/SNI: %s)\n", t.ip, t.pinHow, t.host)
+	}
+	return h + fmt.Sprintf("Time  : %s\n", time.Now().Format(time.RFC3339))
 }
 
 // buildReport renders the TUI's test results as a plain-text report.

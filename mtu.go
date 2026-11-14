@@ -79,7 +79,7 @@ func probeStall(t *target, cfg *config, sni string, r *reporter) {
 	r.info("(each failed attempt waits %s; use -retry=false to skip)", timeout)
 
 	attempt := func(label string, mss int, small bool) bool {
-		res := tlsHandshake(cfg.ctx(), t.addr(), sni, timeout, mss, small)
+		res := tlsHandshake(cfg.ctx(), t.dialAddr(), sni, timeout, mss, small)
 		if res.conn != nil {
 			res.conn.Close()
 		}
@@ -127,7 +127,7 @@ func probeStall(t *target, cfg *config, sni string, r *reporter) {
 	if cfg.mss > 0 && cfg.mss < hi {
 		hi = cfg.mss
 	}
-	if ip := net.ParseIP(t.host); ip != nil && ip.To4() == nil {
+	if ip := net.ParseIP(t.dialHost()); ip != nil && ip.To4() == nil {
 		hi = 1440 // IPv6 header is 20 bytes larger
 	}
 	lo := floor
