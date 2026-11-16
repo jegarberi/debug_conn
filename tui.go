@@ -547,6 +547,8 @@ func (m *model) updateNormal(msg tea.KeyMsg) tea.Cmd {
 		}
 	case "i":
 		m.cfg.insecure = !m.cfg.insecure
+	case "p":
+		m.cfg.publicIP = !m.cfg.publicIP
 	case "1", "2", "3", "4", "5", "6":
 		n := int(msg.String()[0] - '0')
 		if n <= len(m.tests) {
@@ -738,6 +740,11 @@ func (m *model) renderList(height int) string {
 		ins = sWarn.Render("ON")
 	}
 	opts = append(opts, sDim.Render(" insecure ")+ins+sDim.Render("  (i)"))
+	pub := sDim.Render("off")
+	if m.cfg.publicIP {
+		pub = sAccent.Render("ON")
+	}
+	opts = append(opts, sDim.Render(" pub ip   ")+pub+sDim.Render("  (p)"))
 	if m.cfg.forceIP != "" {
 		opts = append(opts, sDim.Render(" ip       ")+sWarn.Render(m.cfg.forceIP))
 	}

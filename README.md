@@ -80,6 +80,7 @@ Exit code is `1` if any test fails.
 | `c` | cancel |
 | `e` / `/` | edit target |
 | `i` | toggle insecure |
+| `p` | toggle public IP lookup (`-public-ip`), used on the next traceroute run |
 | `y` / `Y` | copy full report / selected test to clipboard |
 | `PgUp`/`PgDn`, mouse wheel | scroll |
 | `q` | quit |
