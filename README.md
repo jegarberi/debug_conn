@@ -13,6 +13,15 @@ go build -o debug_conn .
 
 Requires Go 1.23+. Traceroute uses the system `traceroute`, `tracepath` or `mtr`.
 
+Before tracing, the traceroute test prints the route the OS picks to reach the
+target: default gateway (or `none (on-link)` on the local subnet), interface
+and source IP. Gateway and interface come from `ip route get` (Linux),
+`route -n get` (macOS/BSD) or PowerShell `Find-NetRoute` (Windows):
+
+```
+route: gateway 192.168.1.1, interface wlan0, source 192.168.1.20
+```
+
 ## Usage
 
 ```bash
