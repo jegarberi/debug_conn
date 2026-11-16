@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -304,15 +305,27 @@ func testTraceroute(t *target, cfg *config, r *reporter) bool {
 
 // routeInfo reports the gateway, interface and source IP the OS picks to reach
 // host. The source IP comes from a UDP "connect" (no packet is sent); gateway
-// and interface come from `ip route get` (Linux) or `route -n get` (macOS/BSD).
+// and interface come from `ip route get` (Linux), `route -n get` (macOS/BSD)
+// or PowerShell Find-NetRoute (Windows).
 func routeInfo(host string, r *reporter) {
-	src := "?"
+	src, dst := "?", host
 	if c, err := net.Dial("udp", net.JoinHostPort(host, "9")); err == nil {
 		src = c.LocalAddr().(*net.UDPAddr).IP.String()
+		dst = c.RemoteAddr().(*net.UDPAddr).IP.String() // resolved, safe to put in a command line
 		c.Close()
 	}
 	gw, dev := "", ""
-	if out, err := exec.Command("ip", "route", "get", host).Output(); err == nil {
+	if runtime.GOOS == "windows" {
+		// Find-NetRoute returns the source address and the chosen route; keep the route.
+		ps := "$r = Find-NetRoute -RemoteIPAddress '" + dst + "' | Where-Object { $_.NextHop } | Select-Object -First 1; " +
+			"\"$($r.NextHop)|$($r.InterfaceAlias)\""
+		if out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps).Output(); err == nil {
+			gw, dev, _ = strings.Cut(strings.TrimSpace(string(out)), "|")
+			if gw == "0.0.0.0" || gw == "::" {
+				gw = "none (on-link)"
+			}
+		}
+	} else if out, err := exec.Command("ip", "route", "get", host).Output(); err == nil {
 		f := strings.Fields(string(out))
 		for i := 0; i+1 < len(f); i++ {
 			switch f[i] {
@@ -337,7 +350,6 @@ func routeInfo(host string, r *reporter) {
 			}
 		}
 	}
-	// ponytail: no gateway lookup on Windows, `route print` parsing if needed
 	r.info("route: gateway %s, interface %s, source %s", orNone(gw), orNone(dev), src)
 }
 
