@@ -60,6 +60,7 @@ type config struct {
 	prefer6      bool   // pin an IPv6 address when DNS returns both
 	pcap         string // -pcap: write a packet capture here
 	pcapIface    string
+	publicIP     bool // -public-ip: look up the public IP of the outgoing interface
 	tests        map[string]bool
 	portOverride string
 	context      context.Context // cancelled when the TUI quits or re-runs
@@ -354,7 +355,7 @@ func routeInfo(host string, cfg *config, r *reporter) {
 		}
 	}
 	r.info("route: gateway %s, interface %s, source %s", orNone(gw), orNone(dev), src)
-	if srcIP != nil {
+	if cfg.publicIP && srcIP != nil {
 		if pub, err := publicIP(cfg, srcIP); err != nil {
 			r.warn("public IP: %v", err)
 		} else if pub == src {
@@ -731,6 +732,7 @@ func main() {
 	flag.IntVar(&cfg.mss, "mss", 0, "TCP MSS to advertise/use, e.g. 1200 (tests MTU problems; 0 = kernel default)")
 	flag.BoolVar(&cfg.retry, "retry", true, "when TCP connects but TLS/HTTP stall, retry with smaller packets to diagnose MTU problems")
 	flag.StringVar(&cfg.forceIP, "ip", "", "connect to this IP instead of the DNS answer; Host header and SNI keep the hostname (like curl --resolve)")
+	flag.BoolVar(&cfg.publicIP, "public-ip", false, "in the traceroute test, show the public IP of the outgoing interface (asks api.ipify.org)")
 	flag.BoolVar(&cfg.prefer6, "6", false, "prefer an IPv6 address when DNS returns both")
 	flag.StringVar(&cfg.pcap, "pcap", "", "write a packet capture (tcpdump, or dumpcap as fallback) of traffic to/from the target IP to this file")
 	flag.StringVar(&cfg.pcapIface, "pcap-iface", "any", "interface for -pcap")
