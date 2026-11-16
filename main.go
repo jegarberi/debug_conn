@@ -252,7 +252,7 @@ func testDNS(t *target, cfg *config, r *reporter) bool {
 
 func testTraceroute(t *target, cfg *config, r *reporter) bool {
 	r.title("traceroute")
-	routeInfo(t.dialHost(), r)
+	routeInfo(t.dialHost(), cfg, r)
 	hops := strconv.Itoa(cfg.maxHops)
 	type cand struct {
 		bin  string
@@ -306,11 +306,14 @@ func testTraceroute(t *target, cfg *config, r *reporter) bool {
 // routeInfo reports the gateway, interface and source IP the OS picks to reach
 // host. The source IP comes from a UDP "connect" (no packet is sent); gateway
 // and interface come from `ip route get` (Linux), `route -n get` (macOS/BSD)
-// or PowerShell Find-NetRoute (Windows).
-func routeInfo(host string, r *reporter) {
+// or PowerShell Find-NetRoute (Windows). The public IP is what an echo
+// service sees when we connect to it from that same source address.
+func routeInfo(host string, cfg *config, r *reporter) {
 	src, dst := "?", host
+	var srcIP net.IP
 	if c, err := net.Dial("udp", net.JoinHostPort(host, "9")); err == nil {
-		src = c.LocalAddr().(*net.UDPAddr).IP.String()
+		srcIP = c.LocalAddr().(*net.UDPAddr).IP
+		src = srcIP.String()
 		dst = c.RemoteAddr().(*net.UDPAddr).IP.String() // resolved, safe to put in a command line
 		c.Close()
 	}
@@ -351,6 +354,53 @@ func routeInfo(host string, r *reporter) {
 		}
 	}
 	r.info("route: gateway %s, interface %s, source %s", orNone(gw), orNone(dev), src)
+	if srcIP != nil {
+		if pub, err := publicIP(cfg, srcIP); err != nil {
+			r.warn("public IP: %v", err)
+		} else if pub == src {
+			r.info("public IP: %s (same as source, no NAT)", pub)
+		} else {
+			r.info("public IP: %s (NAT)", pub)
+		}
+	}
+}
+
+// publicIP asks an echo service (ipify) which address our traffic comes from,
+// dialing from src so the request leaves through the same interface and
+// address family as the traffic to the target.
+func publicIP(cfg *config, src net.IP) (string, error) {
+	network, u := "tcp4", "https://api.ipify.org"
+	if src.To4() == nil {
+		network, u = "tcp6", "https://api6.ipify.org"
+	}
+	d := &net.Dialer{LocalAddr: &net.TCPAddr{IP: src}, Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil, // a proxy would report its own address
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return d.DialContext(ctx, network, addr)
+			},
+		},
+	}
+	req, err := http.NewRequestWithContext(cfg.ctx(), "GET", u, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return "", err
+	}
+	ip := net.ParseIP(strings.TrimSpace(string(b)))
+	if resp.StatusCode != http.StatusOK || ip == nil {
+		return "", fmt.Errorf("unexpected reply from %s (HTTP %d)", u, resp.StatusCode)
+	}
+	return ip.String(), nil
 }
 
 // ---------- TCP (telnet) ----------

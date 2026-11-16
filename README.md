@@ -16,10 +16,15 @@ Requires Go 1.23+. Traceroute uses the system `traceroute`, `tracepath` or `mtr`
 Before tracing, the traceroute test prints the route the OS picks to reach the
 target: default gateway (or `none (on-link)` on the local subnet), interface
 and source IP. Gateway and interface come from `ip route get` (Linux),
-`route -n get` (macOS/BSD) or PowerShell `Find-NetRoute` (Windows):
+`route -n get` (macOS/BSD) or PowerShell `Find-NetRoute` (Windows).
+
+It then shows the public IP that interface reaches the internet with, by
+asking `api.ipify.org` (or `api6.ipify.org` for IPv6) from the same source
+address, and says whether it differs from the source (NAT):
 
 ```
 route: gateway 192.168.1.1, interface wlan0, source 192.168.1.20
+public IP: 203.0.113.7 (NAT)
 ```
 
 ## Usage
