@@ -251,6 +251,7 @@ func testDNS(t *target, cfg *config, r *reporter) bool {
 
 func testTraceroute(t *target, cfg *config, r *reporter) bool {
 	r.title("traceroute")
+	routeInfo(t.dialHost(), r)
 	hops := strconv.Itoa(cfg.maxHops)
 	type cand struct {
 		bin  string
@@ -299,6 +300,45 @@ func testTraceroute(t *target, cfg *config, r *reporter) bool {
 	}
 	r.warn("no traceroute tool found (install traceroute, iputils-tracepath or mtr)")
 	return false
+}
+
+// routeInfo reports the gateway, interface and source IP the OS picks to reach
+// host. The source IP comes from a UDP "connect" (no packet is sent); gateway
+// and interface come from `ip route get` (Linux) or `route -n get` (macOS/BSD).
+func routeInfo(host string, r *reporter) {
+	src := "?"
+	if c, err := net.Dial("udp", net.JoinHostPort(host, "9")); err == nil {
+		src = c.LocalAddr().(*net.UDPAddr).IP.String()
+		c.Close()
+	}
+	gw, dev := "", ""
+	if out, err := exec.Command("ip", "route", "get", host).Output(); err == nil {
+		f := strings.Fields(string(out))
+		for i := 0; i+1 < len(f); i++ {
+			switch f[i] {
+			case "via":
+				gw = f[i+1]
+			case "dev":
+				dev = f[i+1]
+			}
+		}
+		if gw == "" && dev != "" {
+			gw = "none (on-link)"
+		}
+	} else if out, err := exec.Command("route", "-n", "get", host).Output(); err == nil {
+		for _, l := range strings.Split(string(out), "\n") {
+			k, v, ok := strings.Cut(strings.TrimSpace(l), ":")
+			switch {
+			case !ok:
+			case k == "gateway":
+				gw = strings.TrimSpace(v)
+			case k == "interface":
+				dev = strings.TrimSpace(v)
+			}
+		}
+	}
+	// ponytail: no gateway lookup on Windows, `route print` parsing if needed
+	r.info("route: gateway %s, interface %s, source %s", orNone(gw), orNone(dev), src)
 }
 
 // ---------- TCP (telnet) ----------
